@@ -67,6 +67,8 @@ typedef struct UserInput {
     double cur_lon;
     double dest_lat;
     double dest_lon;
+    int cur_city_matched;
+    int dest_city_matched;
     char cur_city_label[64];
     char dest_city_label[64];
 } UserInput;
@@ -120,6 +122,7 @@ static double g_capacity_for_percentage = 0.0;
 static int g_user_wants_charging = 0;
 static char g_google_map_url[4096] = "";
 static char g_route_map_path[MAX_PATH] = "";
+static const char* kGoogleMapsApiKey = "";
 
 static void TrimInPlace(char* s) {
     size_t start = 0;
@@ -228,7 +231,7 @@ static int ResolveCityCoordinates(const char* cityInput, char* matchedCity, size
     // Philippines geographic center (approx) to keep route logic functional.
     *lat = 12.8797;
     *lon = 121.7740;
-    return 1;
+    return 0;
 }
 
 static void BuildAddress(char* out, size_t outSize, const char* street, const char* city, const char* province, const char* region) {
@@ -279,7 +282,17 @@ static double point_to_segment_km(double px, double py, double ax, double ay, do
 }
 
 static void FindStationsAlongRoute(double startLat, double startLon, double endLat, double endLon, int* outIdx, double* outDist, int maxCount) {
-    int i, k;
+    int i, k, count = 0;
+    int picked = 0;
+    const double kMaxCorridorKm = 20.0;
+    const double kMaxExtraDetourKm = 80.0;
+    const int kCandidateCap = 128;
+    typedef struct StationCandidate {
+        int idx;
+        double score;
+        double t;
+    } StationCandidate;
+    StationCandidate candidates[128];
     double midLat = (startLat + endLat) / 2.0;
     double kmPerDegLat = 111.32;
     double kmPerDegLon = 111.32 * cos(midLat * 3.141592653589793 / 180.0);
@@ -287,6 +300,7 @@ static void FindStationsAlongRoute(double startLat, double startLon, double endL
     double ay = startLat * kmPerDegLat;
     double bx = endLon * kmPerDegLon;
     double by = endLat * kmPerDegLat;
+    double routeKm = distance_km(startLat, startLon, endLat, endLon);
 
     for (k = 0; k < maxCount; ++k) {
         outIdx[k] = -1;
@@ -299,142 +313,170 @@ static void FindStationsAlongRoute(double startLat, double startLon, double endL
         double py = kPhilippineStations[i].lat * kmPerDegLat;
         double corridor = point_to_segment_km(px, py, ax, ay, bx, by, &t);
         double routeStartDist = distance_km(startLat, startLon, kPhilippineStations[i].lat, kPhilippineStations[i].lon);
-        double score = corridor + routeStartDist * 0.12;
-        if (t < 0.0 || t > 1.0) {
-            score += 1000.0;
-        }
+        double routeEndDist = distance_km(endLat, endLon, kPhilippineStations[i].lat, kPhilippineStations[i].lon);
+        double extraDetour = (routeStartDist + routeEndDist) - routeKm;
+        double score = corridor * 1.0 + extraDetour * 0.35;
 
-        for (k = 0; k < maxCount; ++k) {
-            if (score < outDist[k]) {
-                int shift;
-                for (shift = maxCount - 1; shift > k; --shift) {
-                    outDist[shift] = outDist[shift - 1];
-                    outIdx[shift] = outIdx[shift - 1];
-                }
-                outDist[k] = score;
-                outIdx[k] = i;
-                break;
+        if (corridor > kMaxCorridorKm) {
+            continue;
+        }
+        if (extraDetour > kMaxExtraDetourKm) {
+            continue;
+        }
+        if (count >= kCandidateCap) {
+            continue;
+        }
+        candidates[count].idx = i;
+        candidates[count].score = score;
+        candidates[count].t = t;
+        ++count;
+    }
+
+    /* Keep waypoints in travel order so Google Maps stays faithful to typed origin/destination. */
+    for (i = 0; i < count; ++i) {
+        for (k = i + 1; k < count; ++k) {
+            if (candidates[k].t < candidates[i].t ||
+                (fabs(candidates[k].t - candidates[i].t) < 0.0001 && candidates[k].score < candidates[i].score)) {
+                StationCandidate tmp = candidates[i];
+                candidates[i] = candidates[k];
+                candidates[k] = tmp;
             }
         }
     }
+
+    for (i = 0; i < count && picked < maxCount; ++i) {
+        int exists = 0;
+        for (k = 0; k < picked; ++k) {
+            if (outIdx[k] == candidates[i].idx) {
+                exists = 1;
+                break;
+            }
+        }
+        if (!exists) {
+            outIdx[picked] = candidates[i].idx;
+            outDist[picked] = candidates[i].score;
+            ++picked;
+        }
+    }
+
+    /* If no nearby stations qualify, keep all outputs as -1 so route remains exact. */
+    for (k = picked; k < maxCount; ++k) {
+        outIdx[k] = -1;
+        outDist[k] = 1e12;
+    }
 }
 
-static void BuildGoogleMapUrl(const char* originAddress, const char* destinationAddress, const int* idx, int stationCount) {
-    char originEnc[512], destEnc[512], wp[1024];
+static void BuildGoogleMapUrl(const char* originAddress, const char* destinationAddress, const int* stationIdx, int stationCount) {
     int i;
+    char originEnc[512], destEnc[512], wp[2048];
     UrlEncodeSimple(originAddress, originEnc, sizeof(originEnc));
     UrlEncodeSimple(destinationAddress, destEnc, sizeof(destEnc));
     wp[0] = '\0';
 
     for (i = 0; i < stationCount; ++i) {
-        char part[96];
-        if (idx[i] < 0) continue;
+        char part[128];
+        int idx = stationIdx[i];
+        if (idx < 0) continue;
         if (wp[0] != '\0') strncat(wp, "%7C", sizeof(wp) - strlen(wp) - 1);
-        snprintf(part, sizeof(part), "%.6f%%2C%.6f", kPhilippineStations[idx[i]].lat, kPhilippineStations[idx[i]].lon);
+        snprintf(part, sizeof(part), "%.6f%%2C%.6f", kPhilippineStations[idx].lat, kPhilippineStations[idx].lon);
         strncat(wp, part, sizeof(wp) - strlen(wp) - 1);
     }
 
-    snprintf(
-        g_google_map_url,
-        sizeof(g_google_map_url),
-        "https://www.google.com/maps/dir/?api=1&origin=%s&destination=%s&travelmode=driving&waypoints=%s",
-        originEnc,
-        destEnc,
-        wp
-    );
+    if (wp[0] != '\0') {
+        snprintf(
+            g_google_map_url,
+            sizeof(g_google_map_url),
+            "https://www.google.com/maps/dir/?api=1&origin=%s&destination=%s&travelmode=driving&waypoints=%s",
+            originEnc,
+            destEnc,
+            wp
+        );
+    } else {
+        snprintf(
+            g_google_map_url,
+            sizeof(g_google_map_url),
+            "https://www.google.com/maps/dir/?api=1&origin=%s&destination=%s&travelmode=driving",
+            originEnc,
+            destEnc
+        );
+    }
 }
 
 static int WriteRouteMapHtml(
     const char* outputPath,
-    double startLat, double startLon,
-    double endLat, double endLon,
-    const char* startLabel, const char* endLabel,
-    const int* stationIdx, int stationCount
+    const char* originAddress,
+    const char* destinationAddress,
+    double fallbackStartLat, double fallbackStartLon,
+    double fallbackEndLat, double fallbackEndLon
 ) {
     FILE* f = fopen(outputPath, "w");
     int i;
+    char originQuery[512];
+    char destinationQuery[512];
     if (!f) return 0;
+    UrlEncodeSimple(originAddress, originQuery, sizeof(originQuery));
+    UrlEncodeSimple(destinationAddress, destinationQuery, sizeof(destinationQuery));
 
-    fprintf(f, "<!doctype html><html><head><meta charset=\"utf-8\"/><title>EV Route Pins</title>");
+    fprintf(f, "<!doctype html><html><head><meta charset=\"utf-8\"/><title>EV Route Pins - Google Maps</title>");
     fprintf(f, "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"/>");
-    fprintf(f, "<link rel=\"stylesheet\" href=\"https://unpkg.com/leaflet@1.9.4/dist/leaflet.css\"/>");
-    fprintf(f, "<style>html,body,#map{height:100%%;margin:0;} .legend{position:absolute;top:10px;left:10px;background:#fff;padding:10px;border-radius:8px;z-index:999;font-family:Segoe UI;font-size:13px;box-shadow:0 2px 8px rgba(0,0,0,.2);} .tracker{background:#0A84FF;color:#fff;padding:3px 8px;border-radius:999px;font-weight:700;border:2px solid #fff;box-shadow:0 2px 6px rgba(0,0,0,.3);} .ev-dot{width:16px;height:16px;border-radius:50%%;background:#FF0000;border:3px solid #8B0000;box-shadow:0 0 0 2px #FFFFFF,0 2px 8px rgba(0,0,0,.45);}</style>");
-    fprintf(f, "</head><body><div class=\"legend\"><b>EV Charging Route Map</b><br/>Big red circles = charging stations<br/>Blue tracker = route progress</div><div id=\"map\"></div>");
-    fprintf(f, "<script src=\"https://unpkg.com/leaflet@1.9.4/dist/leaflet.js\"></script><script>");
-    fprintf(f, "var map=L.map('map');");
-    fprintf(f, "var osm=L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'&copy; OpenStreetMap'});");
-    fprintf(f, "var carto=L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png',{maxZoom:20,subdomains:'abcd',attribution:'&copy; OpenStreetMap &copy; CARTO'});");
-    fprintf(f, "osm.addTo(map);");
-    fprintf(f, "osm.on('tileerror',function(){if(!map.hasLayer(carto)){map.addLayer(carto);}});");
-    fprintf(f, "var start=[%.6f,%.6f],end=[%.6f,%.6f];", startLat, startLon, endLat, endLon);
-    fprintf(f, "var pts=[start,end];");
-    fprintf(f, "var fullRoute=[];");
-    fprintf(f, "var routePoints=[start];");
-    fprintf(f, "var startMarker=L.marker(start).addTo(map).bindPopup('Current Location: %s');", startLabel);
-    fprintf(f, "var endMarker=L.marker(end).addTo(map).bindPopup('Destination: %s');", endLabel);
-    fprintf(f, "var routeLayer=L.layerGroup().addTo(map);");
-    fprintf(f, "var trackerIcon=L.divIcon({className:'',html:'<div class=\"tracker\">TRACK</div>',iconSize:[58,24],iconAnchor:[29,12]});");
-    fprintf(f, "var tracker=L.marker(start,{icon:trackerIcon}).addTo(map).bindPopup('Tracking from current location to destination');");
-
-    for (i = 0; i < stationCount; ++i) {
-        int id = stationIdx[i];
-        if (id < 0) continue;
-        fprintf(f, "var evIcon%d=L.divIcon({className:'',html:'<div class=\"ev-dot\"></div>',iconSize:[22,22],iconAnchor:[11,11]});", i + 1);
+    fprintf(f, "<style>html,body,#map{height:100%%;margin:0;} .legend{position:absolute;top:10px;left:10px;background:#fff;padding:10px;border-radius:8px;z-index:999;font-family:Segoe UI;font-size:13px;box-shadow:0 2px 8px rgba(0,0,0,.2);} .tracker{background:#0A84FF;color:#fff;padding:3px 8px;border-radius:999px;font-weight:700;border:2px solid #fff;box-shadow:0 2px 6px rgba(0,0,0,.3);}</style>");
+    fprintf(f, "</head><body><div class=\"legend\"><b>Google Maps EV Route</b><br/>Blue lines = possible routes<br/>Red dots = EV charging stations</div><div id=\"map\"></div><script>");
+    fprintf(f, "var originQuery='%s';", originQuery);
+    fprintf(f, "var destinationQuery='%s';", destinationQuery);
+    fprintf(f, "var fallbackStart={lat:%.6f,lng:%.6f},fallbackEnd={lat:%.6f,lng:%.6f};", fallbackStartLat, fallbackStartLon, fallbackEndLat, fallbackEndLon);
+    fprintf(f, "var stations=[");
+    for (i = 0; i < (int)(sizeof(kPhilippineStations) / sizeof(kPhilippineStations[0])); ++i) {
         fprintf(
             f,
-            "L.marker([%.6f,%.6f],{icon:evIcon%d}).addTo(map).bindPopup('Station %d: %s<br/>%s (%s)<br/>%.1f kW');",
-            kPhilippineStations[id].lat, kPhilippineStations[id].lon,
-            i + 1,
-            i + 1, kPhilippineStations[id].name, kPhilippineStations[id].address, kPhilippineStations[id].type, kPhilippineStations[id].power_kw
+            "{name:'%s',address:'%s',city:'%s',type:'%s',power:%.1f,lat:%.6f,lng:%.6f}%s",
+            kPhilippineStations[i].name,
+            kPhilippineStations[i].address,
+            kPhilippineStations[i].city,
+            kPhilippineStations[i].type,
+            kPhilippineStations[i].power_kw,
+            kPhilippineStations[i].lat,
+            kPhilippineStations[i].lon,
+            (i + 1 < (int)(sizeof(kPhilippineStations) / sizeof(kPhilippineStations[0]))) ? "," : ""
         );
-        fprintf(f, "pts.push([%.6f,%.6f]);", kPhilippineStations[id].lat, kPhilippineStations[id].lon);
-        fprintf(f, "routePoints.push([%.6f,%.6f]);", kPhilippineStations[id].lat, kPhilippineStations[id].lon);
     }
-
-    fprintf(f, "routePoints.push(end);");
-    fprintf(f, "async function drawRoadRoute(){");
-    fprintf(f, "for(var i=0;i<routePoints.length-1;i++){");
-    fprintf(f, "var a=routePoints[i],b=routePoints[i+1];");
-    fprintf(f, "var fallback=false;");
-    fprintf(f, "try{");
-    fprintf(f, "var url='https://router.project-osrm.org/route/v1/driving/'+a[1]+','+a[0]+';'+b[1]+','+b[0]+'?overview=full&geometries=geojson';");
-    fprintf(f, "var res=await fetch(url);");
-    fprintf(f, "if(!res.ok) fallback=true;");
-    fprintf(f, "else{");
-    fprintf(f, "var data=await res.json();");
-    fprintf(f, "if(!data.routes||!data.routes.length) fallback=true;");
-    fprintf(f, "else{");
-    fprintf(f, "var coords=data.routes[0].geometry.coordinates.map(function(c){return [c[1],c[0]];});");
-    fprintf(f, "L.polyline(coords,{color:'#0066FF',weight:5,opacity:0.95}).addTo(routeLayer);");
-    fprintf(f, "for(var j=0;j<coords.length;j++){pts.push(coords[j]);}");
-    fprintf(f, "for(var j=0;j<coords.length;j++){fullRoute.push(coords[j]);}");
+    fprintf(f, "];");
+    fprintf(f, "function decodeQ(q){return decodeURIComponent(q.replace(/\\+/g,' '));}");
+    fprintf(f, "function pointNearPath(st,path){for(var i=0;i<path.length;i++){var d=google.maps.geometry.spherical.computeDistanceBetween(new google.maps.LatLng(st.lat,st.lng),path[i]);if(d<=5000) return true;}return false;}");
+    fprintf(f, "function initMap(){");
+    fprintf(f, "var map=new google.maps.Map(document.getElementById('map'),{center:fallbackStart,zoom:6,mapTypeControl:true,streetViewControl:false});");
+    fprintf(f, "var ds=new google.maps.DirectionsService();");
+    fprintf(f, "var dr=new google.maps.DirectionsRenderer({map:map,suppressMarkers:true,polylineOptions:{strokeColor:'#0066FF',strokeWeight:6,strokeOpacity:0.95}});");
+    fprintf(f, "var request={origin:decodeQ(originQuery),destination:decodeQ(destinationQuery),travelMode:google.maps.TravelMode.DRIVING,provideRouteAlternatives:true};");
+    fprintf(f, "ds.route(request,function(result,status){");
+    fprintf(f, "if(status!==google.maps.DirectionsStatus.OK){new google.maps.Marker({position:fallbackStart,map:map,title:'Current Location'});new google.maps.Marker({position:fallbackEnd,map:map,title:'Destination'});map.setCenter(fallbackStart);return;}");
+    fprintf(f, "dr.setDirections(result);");
+    fprintf(f, "var routes=result.routes;");
+    fprintf(f, "var bounds=new google.maps.LatLngBounds();");
+    fprintf(f, "var mainPath=routes[0].overview_path;");
+    fprintf(f, "var allPaths=[];");
+    fprintf(f, "for(var r=0;r<routes.length;r++){allPaths.push(routes[r].overview_path); if(r>0){new google.maps.Polyline({map:map,path:routes[r].overview_path,strokeColor:'#0066FF',strokeWeight:4,strokeOpacity:0.45});}}");
+    fprintf(f, "var startPos=routes[0].legs[0].start_location;var endPos=routes[0].legs[0].end_location;");
+    fprintf(f, "new google.maps.Marker({map:map,position:startPos,title:'Current Location'});");
+    fprintf(f, "new google.maps.Marker({map:map,position:endPos,title:'Destination'});");
+    fprintf(f, "bounds.extend(startPos);bounds.extend(endPos);");
+    fprintf(f, "for(var s=0;s<stations.length;s++){var nearAny=false;for(var rr=0;rr<allPaths.length;rr++){if(pointNearPath(stations[s],allPaths[rr])){nearAny=true;break;}}if(nearAny){var marker=new google.maps.Marker({map:map,position:{lat:stations[s].lat,lng:stations[s].lng},icon:{path:google.maps.SymbolPath.CIRCLE,scale:8,fillColor:'#FF0000',fillOpacity:1,strokeColor:'#8B0000',strokeWeight:3}});var info=new google.maps.InfoWindow({content:'EV Charging: '+stations[s].name+'<br>'+stations[s].address+' ('+stations[s].city+')<br>'+stations[s].type+' '+stations[s].power+' kW'});marker.addListener('click',function(m,i){return function(){i.open(map,m);};}(marker,info));bounds.extend(marker.getPosition());}}");
+    fprintf(f, "map.fitBounds(bounds);");
+    fprintf(f, "var tracker=new google.maps.Marker({map:map,position:startPos,icon:{path:google.maps.SymbolPath.CIRCLE,scale:6,fillColor:'#0A84FF',fillOpacity:1,strokeColor:'#FFFFFF',strokeWeight:2}});");
+    fprintf(f, "var idx=0;setInterval(function(){if(!mainPath.length) return;tracker.setPosition(mainPath[idx]);idx=(idx+1)%%mainPath.length;},600);");
+    fprintf(f, "});");
     fprintf(f, "}");
-    fprintf(f, "}");
-    fprintf(f, "}catch(e){fallback=true;}");
-    fprintf(f, "if(fallback){L.polyline([a,b],{color:'#0066FF',weight:5,opacity:0.95}).addTo(routeLayer);pts.push(a);pts.push(b);fullRoute.push(a);fullRoute.push(b);}");
-    fprintf(f, "}");
-    fprintf(f, "map.fitBounds(L.latLngBounds(pts),{padding:[30,30]});");
-    fprintf(f, "if(fullRoute.length===0){fullRoute=[start,end];}");
-    fprintf(f, "var idx=0;");
-    fprintf(f, "setInterval(function(){");
-    fprintf(f, "if(!fullRoute.length) return;");
-    fprintf(f, "tracker.setLatLng(fullRoute[idx]);");
-    fprintf(f, "if(idx===fullRoute.length-1){idx=0;}else{idx++;}");
-    fprintf(f, "},600);");
-    fprintf(f, "}");
-    fprintf(f, "drawRoadRoute();");
-    fprintf(f, "</script></body></html>");
+    fprintf(f, "</script><script async defer src=\"https://maps.googleapis.com/maps/api/js?key=%s&libraries=geometry&callback=initMap\"></script></body></html>", kGoogleMapsApiKey);
     fclose(f);
     return 1;
 }
 
 static void OpenNearestMap(void) {
-    if (g_route_map_path[0] != '\0') {
-        ShellExecuteA(NULL, "open", g_route_map_path, NULL, NULL, SW_SHOWNORMAL);
-        return;
-    }
     if (g_google_map_url[0] != '\0') {
         ShellExecuteA(NULL, "open", g_google_map_url, NULL, NULL, SW_SHOWNORMAL);
+        return;
+    }
+    if (g_route_map_path[0] != '\0') {
+        ShellExecuteA(NULL, "open", g_route_map_path, NULL, NULL, SW_SHOWNORMAL);
         return;
     }
     MessageBoxA(NULL, "No map is ready yet. Compute a plan first.", "Map", MB_OK | MB_ICONINFORMATION);
@@ -455,6 +497,8 @@ static UserInput get_user_input(void) {
     input.charging_needed_manual = 0;
     input.cur_lat = input.cur_lon = 0.0;
     input.dest_lat = input.dest_lon = 0.0;
+    input.cur_city_matched = 0;
+    input.dest_city_matched = 0;
     input.cur_city_label[0] = '\0';
     input.dest_city_label[0] = '\0';
 
@@ -492,8 +536,8 @@ static UserInput get_user_input(void) {
         strncpy(input.error, "Destination requires at least street and city.", sizeof(input.error) - 1);
         return input;
     }
-    ResolveCityCoordinates(input.cur_city, input.cur_city_label, sizeof(input.cur_city_label), &input.cur_lat, &input.cur_lon);
-    ResolveCityCoordinates(input.dest_city, input.dest_city_label, sizeof(input.dest_city_label), &input.dest_lat, &input.dest_lon);
+    input.cur_city_matched = ResolveCityCoordinates(input.cur_city, input.cur_city_label, sizeof(input.cur_city_label), &input.cur_lat, &input.cur_lon);
+    input.dest_city_matched = ResolveCityCoordinates(input.dest_city, input.dest_city_label, sizeof(input.dest_city_label), &input.dest_lat, &input.dest_lon);
 
     ToLowerCopy(chargeText, lowerCharge, sizeof(lowerCharge));
     if (strcmp(lowerCharge, "yes") == 0 || strcmp(lowerCharge, "y") == 0) {
@@ -607,6 +651,7 @@ static void ComputePlan(HWND hWnd) {
     double available, gross_used, regen, net_used, max_range;
     int alongIdx[MAX_ROUTE_STATIONS];
     double alongScore[MAX_ROUTE_STATIONS];
+    int includeWaypoints = 0;
     int i;
     const char* recommendation;
 
@@ -634,29 +679,13 @@ static void ComputePlan(HWND hWnd) {
         alongIdx[i] = -1;
         alongScore[i] = 0.0;
     }
-    FindStationsAlongRoute(in.cur_lat, in.cur_lon, in.dest_lat, in.dest_lon, alongIdx, alongScore, MAX_ROUTE_STATIONS);
+    includeWaypoints = (in.cur_city_matched && in.dest_city_matched);
+    if (includeWaypoints) {
+        FindStationsAlongRoute(in.cur_lat, in.cur_lon, in.dest_lat, in.dest_lon, alongIdx, alongScore, MAX_ROUTE_STATIONS);
+    }
     BuildGoogleMapUrl(originAddress, destinationAddress, alongIdx, MAX_ROUTE_STATIONS);
 
-    {
-        char exePath[MAX_PATH];
-        char* slash;
-        GetModuleFileNameA(NULL, exePath, MAX_PATH);
-        slash = strrchr(exePath, '\\');
-        if (slash) {
-            *(slash + 1) = '\0';
-            snprintf(g_route_map_path, sizeof(g_route_map_path), "%sev_route_map.html", exePath);
-        } else {
-            snprintf(g_route_map_path, sizeof(g_route_map_path), "ev_route_map.html");
-        }
-    }
-
-    WriteRouteMapHtml(
-        g_route_map_path,
-        in.cur_lat, in.cur_lon,
-        in.dest_lat, in.dest_lon,
-        in.cur_city_label, in.dest_city_label,
-        alongIdx, MAX_ROUTE_STATIONS
-    );
+    g_route_map_path[0] = '\0';
 
     output[0] = '\0';
     AppendLine(output, sizeof(output), "----------------------------------------------------");
@@ -690,20 +719,12 @@ static void ComputePlan(HWND hWnd) {
         AppendLine(output, sizeof(output), "ADVISORY: Trip exceeds estimated max range.");
     }
 
-    AppendLine(output, sizeof(output), "EV charging stations selected along route:");
-    for (i = 0; i < MAX_ROUTE_STATIONS; ++i) {
-        if (alongIdx[i] >= 0) {
-            const ChargingStation* s = &kPhilippineStations[alongIdx[i]];
-            snprintf(
-                line, sizeof(line),
-                "%d. %s - %s, %s [%s, %.1f kW]",
-                i + 1, s->name, s->address, s->city, s->type, s->power_kw
-            );
-            AppendLine(output, sizeof(output), line);
-        }
+    AppendLine(output, sizeof(output), "Google Maps opens with your typed starting point and destination.");
+    if (includeWaypoints) {
+        AppendLine(output, sizeof(output), "EV charging stations are added as route waypoints.");
+    } else {
+        AppendLine(output, sizeof(output), "No station waypoints were added for this input.");
     }
-
-    AppendLine(output, sizeof(output), "Map opened with large red circle pins.");
     AppendLine(output, sizeof(output), "----------------------------------------------------");
     SetWindowTextA(g_ctrls.output, output);
     OpenNearestMap();

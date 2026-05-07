@@ -36,6 +36,7 @@ static const CityCoord kPhilippineCityCoords[] = {
     {"paranaque", "Paranaque", 14.4793, 121.0198},
     {"muntinlupa", "Muntinlupa", 14.4081, 121.0415},
     {"caloocan", "Caloocan", 14.7566, 121.0453},
+    {"san jose del monte", "San Jose del Monte", 14.8139, 121.0453},
     {"angeles", "Angeles", 15.1450, 120.5887},
     {"san fernando", "San Fernando", 15.0343, 120.6840},
     {"olongapo", "Olongapo", 14.8386, 120.2842},
